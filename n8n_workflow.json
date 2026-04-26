@@ -1,0 +1,625 @@
+{
+  "name": "AI-Powered Attendance & Warning System",
+  "nodes": [
+    {
+      "id": "a1b2c3d4-0001",
+      "name": "Webhook — Receive Excel Upload",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [120, 340],
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "attendance-upload",
+        "responseMode": "responseNode",
+        "options": {
+          "binaryData": true,
+          "rawBody": false
+        }
+      },
+      "notes": "HR team POSTs the daily Excel export here. Accepts multipart/form-data with the file in the 'attendanceFile' field."
+    },
+    {
+      "id": "a1b2c3d4-0002",
+      "name": "Extract Spreadsheet Rows",
+      "type": "n8n-nodes-base.spreadsheetFile",
+      "typeVersion": 1,
+      "position": [360, 340],
+      "parameters": {
+        "operation": "fromFile",
+        "binaryPropertyName": "attendanceFile",
+        "options": {
+          "headerRow": true,
+          "sheetName": "Sheet1",
+          "includeEmptyCells": false,
+          "range": ""
+        }
+      },
+      "notes": "Parses the uploaded Excel (.xlsx) file into individual row items. Each row = one punch record."
+    },
+    {
+      "id": "a1b2c3d4-0003",
+      "name": "Aggregate & Transform Punches",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [600, 340],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────────\n// STEP 1 — Normalise every raw punch record\n// ─────────────────────────────────────────────────────────────────────────\nconst LATE_THRESHOLD_HOUR = 11; // 11:00 AM\nconst LATE_THRESHOLD_MINUTE = 0;\n\nconst rawRows = items.map(i => i.json);\n\n// ─────────────────────────────────────────────────────────────────────────\n// STEP 2 — Group by EmployeeID + Date\n// ─────────────────────────────────────────────────────────────────────────\nconst groups = {};\n\nfor (const row of rawRows) {\n  const empId   = String(row['Employee ID'] || '').trim();\n  const name    = String(row['Name']        || '').trim();\n  const rawDate = String(row['Date']        || '').trim();\n  const rawTime = String(row['Time']        || '').trim();\n  const status  = String(row['Punch Status'] || '').toUpperCase().trim(); // IN or OUT\n\n  if (!empId || !rawDate || !rawTime || !status) continue;\n\n  // Normalise date to YYYY-MM-DD\n  const parsedDate = new Date(rawDate);\n  const dateKey = isNaN(parsedDate)\n    ? rawDate\n    : parsedDate.toISOString().split('T')[0];\n\n  // Parse time into a sortable number (minutes since midnight)\n  const parseTime = (t) => {\n    // Handles formats: \"09:30 AM\", \"14:30\", \"9:30\", \"09:30:00 AM\"\n    const clean = t.replace(/\\s+/g, ' ').trim();\n    const ampmMatch = clean.match(/^(\\d{1,2}):(\\d{2})(?::\\d{2})?\\s*(AM|PM)$/i);\n    const h24Match  = clean.match(/^(\\d{1,2}):(\\d{2})(?::\\d{2})?$/);\n\n    let h = 0, m = 0;\n    if (ampmMatch) {\n      h = parseInt(ampmMatch[1], 10);\n      m = parseInt(ampmMatch[2], 10);\n      const meridiem = ampmMatch[3].toUpperCase();\n      if (meridiem === 'PM' && h !== 12) h += 12;\n      if (meridiem === 'AM' && h === 12) h = 0;\n    } else if (h24Match) {\n      h = parseInt(h24Match[1], 10);\n      m = parseInt(h24Match[2], 10);\n    }\n    return { totalMinutes: h * 60 + m, h, m };\n  };\n\n  const { totalMinutes, h, m } = parseTime(rawTime);\n  const groupKey = `${empId}||${dateKey}`;\n\n  if (!groups[groupKey]) {\n    groups[groupKey] = {\n      employeeId: empId,\n      name,\n      date: dateKey,\n      inPunches:  [],\n      outPunches: []\n    };\n  }\n\n  if (status === 'IN')  groups[groupKey].inPunches.push({ rawTime, totalMinutes, h, m });\n  if (status === 'OUT') groups[groupKey].outPunches.push({ rawTime, totalMinutes, h, m });\n}\n\n// ─────────────────────────────────────────────────────────────────────────\n// STEP 3 — For each group, derive Check-In / Check-Out / Late Flag\n// ─────────────────────────────────────────────────────────────────────────\nconst results = [];\n\nfor (const key of Object.keys(groups)) {\n  const g = groups[key];\n\n  // Sort punches\n  g.inPunches.sort((a, b)  => a.totalMinutes - b.totalMinutes);\n  g.outPunches.sort((a, b) => a.totalMinutes - b.totalMinutes);\n\n  const firstIn  = g.inPunches[0]  || null;\n  const lastOut  = g.outPunches[g.outPunches.length - 1] || null;\n\n  // Format time helper → \"HH:MM AM/PM\"\n  const formatTime = (punch) => {\n    if (!punch) return null;\n    let h = punch.h, m = punch.m;\n    const meridiem = h >= 12 ? 'PM' : 'AM';\n    const displayH = h % 12 === 0 ? 12 : h % 12;\n    return `${String(displayH).padStart(2,'0')}:${String(m).padStart(2,'0')} ${meridiem}`;\n  };\n\n  // Late Rule: first IN punch after 11:00 AM\n  let lateFlag = 'NO';\n  let missingOut = false;\n\n  if (firstIn) {\n    const lateThreshold = LATE_THRESHOLD_HOUR * 60 + LATE_THRESHOLD_MINUTE;\n    if (firstIn.totalMinutes > lateThreshold) lateFlag = 'YES';\n  }\n\n  // Edge-case: missing OUT punch\n  if (!lastOut) {\n    missingOut = true;\n  }\n\n  results.push({\n    json: {\n      employeeId:  g.employeeId,\n      name:        g.name,\n      date:        g.date,\n      checkIn:     formatTime(firstIn)  || 'MISSING',\n      checkOut:    formatTime(lastOut)  || 'MISSING',\n      lateFlag,\n      missingOut,\n      rawInCount:  g.inPunches.length,\n      rawOutCount: g.outPunches.length\n    }\n  });\n}\n\nreturn results;"
+      },
+      "notes": "Core transformation: groups all punches per employee per day, derives earliest IN (check-in), latest OUT (check-out), and applies the late rule (>11:00 AM). Also detects missing OUT punches."
+    },
+    {
+      "id": "a1b2c3d4-0004",
+      "name": "Write Daily Records to Google Sheets",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4,
+      "position": [840, 220],
+      "parameters": {
+        "operation": "appendOrUpdate",
+        "documentId": {
+          "__rl": true,
+          "value": "={{ $vars.SHEET_ID }}",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "DailyRecords",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "Employee ID": "={{ $json.employeeId }}",
+            "Name":        "={{ $json.name }}",
+            "Date":        "={{ $json.date }}",
+            "Check-In":   "={{ $json.checkIn }}",
+            "Check-Out":  "={{ $json.checkOut }}",
+            "Late Flag":  "={{ $json.lateFlag }}",
+            "Missing OUT":"={{ $json.missingOut }}"
+          }
+        },
+        "matchingColumns": ["Employee ID", "Date"],
+        "options": {
+          "cellFormat": "USER_ENTERED"
+        }
+      },
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "cred-google-sheets",
+          "name": "Google Sheets Account"
+        }
+      }
+    },
+    {
+      "id": "a1b2c3d4-0005",
+      "name": "Filter — Only Late Arrivals",
+      "type": "n8n-nodes-base.filter",
+      "typeVersion": 2,
+      "position": [840, 460],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": false,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "cond-1",
+              "leftValue": "={{ $json.lateFlag }}",
+              "rightValue": "YES",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true
+      },
+      "notes": "Only records where lateFlag = YES flow forward to the warning pipeline."
+    },
+    {
+      "id": "a1b2c3d4-0006",
+      "name": "Read Monthly Late Counter",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4,
+      "position": [1080, 460],
+      "parameters": {
+        "operation": "read",
+        "documentId": {
+          "__rl": true,
+          "value": "={{ $vars.SHEET_ID }}",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "MonthlyLateCounter",
+          "mode": "name"
+        },
+        "filters": {
+          "values": [
+            {
+              "lookupColumn": "Employee ID",
+              "lookupValue": "={{ $json.employeeId }}"
+            },
+            {
+              "lookupColumn": "Month/Year",
+              "lookupValue": "={{ new Date($json.date).toLocaleDateString('en-US', { month: 'long', year: 'numeric' }) }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "cred-google-sheets",
+          "name": "Google Sheets Account"
+        }
+      }
+    },
+    {
+      "id": "a1b2c3d4-0007",
+      "name": "Calculate New Strike Count",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1320, 460],
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Merge the late employee data (from filter node) with the existing\n// monthly counter data (from Google Sheets read). \n// $input.item.json = the late attendance record\n// $('Read Monthly Late Counter').item.json = existing counter row (or empty)\n\nconst attendance = $input.item.json;\nconst existingRow = $('Read Monthly Late Counter').item.json;\n\nconst monthYear = new Date(attendance.date)\n  .toLocaleDateString('en-US', { month: 'long', year: 'numeric' });\n\n// If no existing row was found, existingRow will have no Employee ID\nconst previousCount = parseInt(existingRow['Current Monthly Late Count'] || '0', 10);\nconst newCount = previousCount + 1;\n\n// Cap at 3 for routing purposes (3+ all get 3rd-strike treatment)\nconst strikeLevel = Math.min(newCount, 3);\n\nreturn {\n  json: {\n    ...attendance,\n    previousCount,\n    newCount,\n    strikeLevel,\n    monthYear,\n    lastWarningDate: attendance.date,\n    isNewRow: !existingRow['Employee ID']\n  }\n};"
+      }
+    },
+    {
+      "id": "a1b2c3d4-0008",
+      "name": "Update Monthly Late Counter in Sheets",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4,
+      "position": [1560, 460],
+      "parameters": {
+        "operation": "appendOrUpdate",
+        "documentId": {
+          "__rl": true,
+          "value": "={{ $vars.SHEET_ID }}",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "MonthlyLateCounter",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "Employee ID":                "={{ $json.employeeId }}",
+            "Name":                       "={{ $json.name }}",
+            "Current Monthly Late Count": "={{ $json.newCount }}",
+            "Last Warning Date":          "={{ $json.lastWarningDate }}",
+            "Month/Year":                 "={{ $json.monthYear }}"
+          }
+        },
+        "matchingColumns": ["Employee ID", "Month/Year"],
+        "options": {}
+      },
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "cred-google-sheets",
+          "name": "Google Sheets Account"
+        }
+      }
+    },
+    {
+      "id": "a1b2c3d4-0009",
+      "name": "Route by Strike Level",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3,
+      "position": [1800, 460],
+      "parameters": {
+        "mode": "rules",
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.strikeLevel }}",
+                    "rightValue": 1,
+                    "operator": { "type": "number", "operation": "equals" }
+                  }
+                ]
+              },
+              "renameOutput": true,
+              "outputKey": "Strike 1"
+            },
+            {
+              "conditions": {
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.strikeLevel }}",
+                    "rightValue": 2,
+                    "operator": { "type": "number", "operation": "equals" }
+                  }
+                ]
+              },
+              "renameOutput": true,
+              "outputKey": "Strike 2"
+            },
+            {
+              "conditions": {
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.strikeLevel }}",
+                    "rightValue": 3,
+                    "operator": { "type": "number", "operation": "equals" }
+                  }
+                ]
+              },
+              "renameOutput": true,
+              "outputKey": "Strike 3"
+            }
+          ]
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "a1b2c3d4-0010",
+      "name": "AI — Draft Strike 1 Warning Email",
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 1,
+      "position": [2040, 240],
+      "parameters": {
+        "promptType": "define",
+        "text": "=You are an empathetic but professional HR communication specialist at Growify.\n\nDraft a warm, personalized first-strike late-arrival warning email for the following employee:\n\nEmployee Name: {{ $json.name }}\nEmployee ID: {{ $json.employeeId }}\nDate of Late Arrival: {{ $json.date }}\nCheck-In Time: {{ $json.checkIn }}\nCompany Policy: Employees are expected to arrive by 11:00 AM.\n\nGuidelines:\n- Tone: Friendly and supportive — this is a gentle reminder, NOT a reprimand.\n- Acknowledge that this is the FIRST time (Strike 1 of 3).\n- Express understanding that occasional delays happen.\n- Clearly state the policy (check-in by 11:00 AM).\n- Encourage the employee to reach out to their manager if they're facing any challenges.\n- Close warmly.\n- Length: 3–4 short paragraphs.\n- Do NOT use generic placeholders like [Manager Name]. Address it from \"The HR Team at Growify\".\n\nOutput ONLY the email body (no subject line). Start with 'Dear {{ $json.name }},'.",
+        "options": {}
+      }
+    },
+    {
+      "id": "a1b2c3d4-0011",
+      "name": "AI — Draft Strike 2 Warning Email",
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 1,
+      "position": [2040, 460],
+      "parameters": {
+        "promptType": "define",
+        "text": "=You are an HR communication specialist at Growify.\n\nDraft a firm but professional second-strike late-arrival warning email for the following employee:\n\nEmployee Name: {{ $json.name }}\nEmployee ID: {{ $json.employeeId }}\nDate of Late Arrival: {{ $json.date }}\nCheck-In Time: {{ $json.checkIn }}\nTotal Late Arrivals This Month: {{ $json.newCount }}\nCompany Policy: Employees are expected to arrive by 11:00 AM.\n\nGuidelines:\n- Tone: More serious and direct than the first warning, but still respectful and professional.\n- Explicitly note this is the SECOND late arrival this month (Strike 2 of 3).\n- Reference that a first reminder was already issued.\n- Clearly communicate that a third late arrival will trigger a mandatory meeting with HR.\n- Offer support — ask if there is anything causing consistent delays.\n- Do NOT use generic placeholders.\n- Length: 3–5 paragraphs.\n\nOutput ONLY the email body. Start with 'Dear {{ $json.name }},'.",
+        "options": {}
+      }
+    },
+    {
+      "id": "a1b2c3d4-0012",
+      "name": "AI — Draft Strike 3 Final Warning Email",
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 1,
+      "position": [2040, 700],
+      "parameters": {
+        "promptType": "define",
+        "text": "=You are a senior HR communication specialist at Growify.\n\nDraft a formal and serious final-strike warning email for the following employee:\n\nEmployee Name: {{ $json.name }}\nEmployee ID: {{ $json.employeeId }}\nDate of Late Arrival: {{ $json.date }}\nCheck-In Time: {{ $json.checkIn }}\nTotal Late Arrivals This Month: {{ $json.newCount }}\nMandatory Meeting: Today at 5:00 PM\nCalendar Link: {{ $json.calendarEventLink || 'See attached calendar invite' }}\n\nGuidelines:\n- Tone: Formal, serious, and unambiguous. This is the THIRD and final strike.\n- Clearly state this is the third late arrival this month — a threshold that triggers formal HR review.\n- Inform the employee of the mandatory 5:00 PM meeting TODAY with HR.\n- Include the calendar event link prominently.\n- State that failure to attend the meeting without prior notice will be treated as non-compliance.\n- Maintain professional dignity — do not shame or threaten.\n- Length: 4–5 paragraphs.\n\nOutput ONLY the email body. Start with 'Dear {{ $json.name }},'.",
+        "options": {}
+      }
+    },
+    {
+      "id": "a1b2c3d4-0013",
+      "name": "Anthropic Claude — LLM",
+      "type": "@n8n/n8n-nodes-langchain.lmChatAnthropic",
+      "typeVersion": 1.2,
+      "position": [2040, 860],
+      "parameters": {
+        "model": "claude-opus-4-5-20251101",
+        "options": {
+          "maxTokens": 800,
+          "temperature": 0.7
+        }
+      },
+      "credentials": {
+        "anthropicApi": {
+          "id": "cred-anthropic",
+          "name": "Anthropic API"
+        }
+      },
+      "notes": "Shared LLM for all three AI agent nodes via sub-workflow connection."
+    },
+    {
+      "id": "a1b2c3d4-0014",
+      "name": "Create 5 PM Google Calendar Meeting (Strike 3)",
+      "type": "n8n-nodes-base.googleCalendar",
+      "typeVersion": 1.2,
+      "position": [2280, 700],
+      "parameters": {
+        "operation": "create",
+        "calendarId": "primary",
+        "start": "={{ (() => { const d = new Date($json.date); d.setHours(17,0,0,0); return d.toISOString(); })() }}",
+        "end":   "={{ (() => { const d = new Date($json.date); d.setHours(18,0,0,0); return d.toISOString(); })() }}",
+        "additionalFields": {
+          "summary": "={{ `HR Meeting — ${$json.name} (${$json.employeeId}) | Third Late Arrival Review` }}",
+          "description": "={{ `Mandatory HR review meeting for ${$json.name} (${$json.employeeId}) following their third late arrival this month.\\n\\nDate of Incident: ${$json.date}\\nCheck-In Time: ${$json.checkIn}\\n\\nThis meeting is required. Please contact HR immediately if you have an emergency.` }}",
+          "attendees": "={{ $json.employeeEmail || '' }}",
+          "location": "HR Conference Room / Google Meet",
+          "sendUpdates": "all",
+          "conferenceDataVersion": 1
+        }
+      },
+      "credentials": {
+        "googleCalendarOAuth2Api": {
+          "id": "cred-google-calendar",
+          "name": "Google Calendar Account"
+        }
+      }
+    },
+    {
+      "id": "a1b2c3d4-0015",
+      "name": "Inject Calendar Link into Strike 3 Data",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [2520, 700],
+      "parameters": {
+        "mode": "keepAllExistingFields",
+        "assignments": {
+          "assignments": [
+            {
+              "id": "assign-1",
+              "name": "calendarEventLink",
+              "value": "={{ $json.htmlLink }}",
+              "type": "string"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "a1b2c3d4-0016",
+      "name": "Send Strike 1 Warning Email",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [2280, 240],
+      "parameters": {
+        "operation": "send",
+        "sendTo": "={{ $('AI — Draft Strike 1 Warning Email').item.json.employeeEmail || $json.employeeId + '@growify.in' }}",
+        "subject": "={{ `[Friendly Reminder] Late Arrival on ${$json.date} — Growify HR` }}",
+        "emailType": "text",
+        "message": "={{ $('AI — Draft Strike 1 Warning Email').item.json.output }}",
+        "options": {
+          "ccList": "hr@growify.in",
+          "appendAttribution": false
+        }
+      },
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "cred-gmail",
+          "name": "Gmail Account"
+        }
+      }
+    },
+    {
+      "id": "a1b2c3d4-0017",
+      "name": "Send Strike 2 Warning Email",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [2280, 460],
+      "parameters": {
+        "operation": "send",
+        "sendTo": "={{ $json.employeeId + '@growify.in' }}",
+        "subject": "={{ `[Second Warning] Repeated Late Arrival — ${$json.date} | Growify HR` }}",
+        "emailType": "text",
+        "message": "={{ $('AI — Draft Strike 2 Warning Email').item.json.output }}",
+        "options": {
+          "ccList": "hr@growify.in",
+          "appendAttribution": false
+        }
+      },
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "cred-gmail",
+          "name": "Gmail Account"
+        }
+      }
+    },
+    {
+      "id": "a1b2c3d4-0018",
+      "name": "Send Strike 3 Final Warning Email",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [2760, 700],
+      "parameters": {
+        "operation": "send",
+        "sendTo": "={{ $json.employeeId + '@growify.in' }}",
+        "subject": "={{ `[FINAL WARNING + Meeting Required] Late Arrival Policy Breach — ${$json.date}` }}",
+        "emailType": "text",
+        "message": "={{ $('AI — Draft Strike 3 Final Warning Email').item.json.output }}",
+        "options": {
+          "ccList": "hr@growify.in,manager@growify.in",
+          "appendAttribution": false
+        }
+      },
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "cred-gmail",
+          "name": "Gmail Account"
+        }
+      }
+    },
+    {
+      "id": "a1b2c3d4-0019",
+      "name": "Alert HR — Missing OUT Punch",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [840, 620],
+      "parameters": {
+        "operation": "send",
+        "sendTo": "hr@growify.in",
+        "subject": "={{ `[Data Alert] Missing Check-Out Punch — ${$json.date}` }}",
+        "emailType": "text",
+        "message": "=⚠️ Missing OUT Punch Detected\n\nEmployee: {{ $json.name }} ({{ $json.employeeId }})\nDate: {{ $json.date }}\nCheck-In Recorded: {{ $json.checkIn }}\nCheck-Out: NOT RECORDED\n\nThe system could not find an OUT punch for this employee on this date. The daily record has been saved with Check-Out marked as MISSING.\n\nPlease verify manually or contact the employee.\n\n— Attendance Automation System",
+        "options": {}
+      },
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "cred-gmail",
+          "name": "Gmail Account"
+        }
+      }
+    },
+    {
+      "id": "a1b2c3d4-0020",
+      "name": "Filter — Missing OUT Punch Only",
+      "type": "n8n-nodes-base.filter",
+      "typeVersion": 2,
+      "position": [840, 500],
+      "parameters": {
+        "conditions": {
+          "conditions": [
+            {
+              "id": "cond-missing",
+              "leftValue": "={{ $json.missingOut }}",
+              "rightValue": true,
+              "operator": { "type": "boolean", "operation": "true" }
+            }
+          ],
+          "combinator": "and"
+        }
+      }
+    },
+    {
+      "id": "a1b2c3d4-0021",
+      "name": "Webhook Response — Success",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [3000, 460],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ status: 'success', message: 'Attendance file processed successfully.', processedAt: new Date().toISOString() }) }}",
+        "options": {
+          "responseCode": 200
+        }
+      }
+    }
+  ],
+
+  "connections": {
+    "Webhook — Receive Excel Upload": {
+      "main": [
+        [{ "node": "Extract Spreadsheet Rows", "type": "main", "index": 0 }]
+      ]
+    },
+    "Extract Spreadsheet Rows": {
+      "main": [
+        [{ "node": "Aggregate & Transform Punches", "type": "main", "index": 0 }]
+      ]
+    },
+    "Aggregate & Transform Punches": {
+      "main": [
+        [
+          { "node": "Write Daily Records to Google Sheets", "type": "main", "index": 0 },
+          { "node": "Filter — Only Late Arrivals",           "type": "main", "index": 0 },
+          { "node": "Filter — Missing OUT Punch Only",       "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Filter — Only Late Arrivals": {
+      "main": [
+        [{ "node": "Read Monthly Late Counter", "type": "main", "index": 0 }]
+      ]
+    },
+    "Filter — Missing OUT Punch Only": {
+      "main": [
+        [{ "node": "Alert HR — Missing OUT Punch", "type": "main", "index": 0 }]
+      ]
+    },
+    "Read Monthly Late Counter": {
+      "main": [
+        [{ "node": "Calculate New Strike Count", "type": "main", "index": 0 }]
+      ]
+    },
+    "Calculate New Strike Count": {
+      "main": [
+        [{ "node": "Update Monthly Late Counter in Sheets", "type": "main", "index": 0 }]
+      ]
+    },
+    "Update Monthly Late Counter in Sheets": {
+      "main": [
+        [{ "node": "Route by Strike Level", "type": "main", "index": 0 }]
+      ]
+    },
+    "Route by Strike Level": {
+      "main": [
+        [{ "node": "AI — Draft Strike 1 Warning Email", "type": "main", "index": 0 }],
+        [{ "node": "AI — Draft Strike 2 Warning Email", "type": "main", "index": 0 }],
+        [{ "node": "AI — Draft Strike 3 Final Warning Email", "type": "main", "index": 0 }]
+      ]
+    },
+    "AI — Draft Strike 1 Warning Email": {
+      "main": [
+        [{ "node": "Send Strike 1 Warning Email", "type": "main", "index": 0 }]
+      ]
+    },
+    "AI — Draft Strike 2 Warning Email": {
+      "main": [
+        [{ "node": "Send Strike 2 Warning Email", "type": "main", "index": 0 }]
+      ]
+    },
+    "AI — Draft Strike 3 Final Warning Email": {
+      "main": [
+        [{ "node": "Create 5 PM Google Calendar Meeting (Strike 3)", "type": "main", "index": 0 }]
+      ]
+    },
+    "Create 5 PM Google Calendar Meeting (Strike 3)": {
+      "main": [
+        [{ "node": "Inject Calendar Link into Strike 3 Data", "type": "main", "index": 0 }]
+      ]
+    },
+    "Inject Calendar Link into Strike 3 Data": {
+      "main": [
+        [{ "node": "Send Strike 3 Final Warning Email", "type": "main", "index": 0 }]
+      ]
+    },
+    "Send Strike 1 Warning Email": {
+      "main": [
+        [{ "node": "Webhook Response — Success", "type": "main", "index": 0 }]
+      ]
+    },
+    "Send Strike 2 Warning Email": {
+      "main": [
+        [{ "node": "Webhook Response — Success", "type": "main", "index": 0 }]
+      ]
+    },
+    "Send Strike 3 Final Warning Email": {
+      "main": [
+        [{ "node": "Webhook Response — Success", "type": "main", "index": 0 }]
+      ]
+    }
+  },
+
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner",
+    "errorWorkflow": "",
+    "timezone": "Asia/Kolkata"
+  },
+
+  "staticData": null,
+  "tags": ["HR", "Attendance", "AI", "Growify"],
+  "triggerCount": 1,
+  "updatedAt": "2025-07-10T00:00:00.000Z",
+  "versionId": "v1.0.0",
+
+  "_meta": {
+    "instanceId": "growify-attendance-system",
+    "requiredCredentials": [
+      { "type": "googleSheetsOAuth2Api",  "name": "Google Sheets Account",  "id": "cred-google-sheets" },
+      { "type": "googleCalendarOAuth2Api","name": "Google Calendar Account", "id": "cred-google-calendar" },
+      { "type": "gmailOAuth2",            "name": "Gmail Account",           "id": "cred-gmail" },
+      { "type": "anthropicApi",           "name": "Anthropic API",           "id": "cred-anthropic" }
+    ],
+    "requiredVariables": [
+      { "name": "SHEET_ID", "description": "Google Sheets document ID containing DailyRecords and MonthlyLateCounter tabs" }
+    ],
+    "setupInstructions": [
+      "1. Import this JSON into n8n via Workflows → Import from File",
+      "2. Add all four credentials listed above under Settings → Credentials",
+      "3. Set the SHEET_ID variable under Settings → Variables to your Google Sheet ID",
+      "4. Create two tabs in your Google Sheet: 'DailyRecords' and 'MonthlyLateCounter'",
+      "5. Activate the workflow — the webhook URL will be displayed in the Webhook node"
+    ]
+  }
+}
